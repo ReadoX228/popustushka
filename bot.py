@@ -1,8 +1,10 @@
 import os
 import re
-from collections import defaultdict, deque
+import time
+import asyncio
+from collections import OrderedDict, deque
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -35,13 +37,28 @@ REFUSAL_PHRASES = (
 ai_client = AsyncOpenAI(
     api_key=API_KEY,
     base_url=BASE_URL,
+    timeout=45.0,
+    max_retries=2,
 )
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-channel_history = defaultdict(lambda: deque(maxlen=10))
+
+# Ограничиваем память 100 активными каналами, чтобы RAM на хостинге не забивалась
+MAX_CHANNELS = 100
+channel_history: OrderedDict[int, deque] = OrderedDict()
+
+
+def get_channel_history(channel_id: int) -> deque:
+    if channel_id not in channel_history:
+        if len(channel_history) >= MAX_CHANNELS:
+            channel_history.popitem(last=False)
+        channel_history[channel_id] = deque(maxlen=10)
+    else:
+        channel_history.move_to_end(channel_id)
+    return channel_history[channel_id]
 
 
 def is_admin_or_owner():
@@ -67,10 +84,36 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
+@tasks.loop(minutes=3)
+async def keep_alive_loop():
+    """Периодическая проверка соединения со шлюзом Discord."""
+    await bot.wait_until_ready()
+    if bot.is_closed():
+        return
+    try:
+        latency_ms = round(bot.latency * 1000)
+        if latency_ms > 5000:
+            print(f"[WARN] Высокий пинг до Discord: {latency_ms} мс")
+    except Exception as e:
+        print(f"[WARN] Ошибка в keep_alive_loop: {e}")
+
+
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
     print(f"Модель: {MODEL_NAME} | Эндпоинт: {BASE_URL}")
+    if not keep_alive_loop.is_running():
+        keep_alive_loop.start()
+
+
+@bot.event
+async def on_disconnect():
+    print("[INFO] Соединение с Discord прервано. Переподключение...")
+
+
+@bot.event
+async def on_resumed():
+    print("[INFO] Соединение с Discord восстановлено.")
 
 
 @bot.event
@@ -78,14 +121,14 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CheckFailure):
         await ctx.reply("Эта команда доступна только создателю сервера и администраторам.", mention_author=False)
     else:
-        raise error
+        print(f"[ERROR] Ошибка команды: {error}")
 
 
 @bot.command(name="clear")
 @is_admin_or_owner()
 async def clear_history(ctx: commands.Context):
     """Очищает память бота в текущем канале."""
-    channel_history[ctx.channel.id].clear()
+    get_channel_history(ctx.channel.id).clear()
     await ctx.reply("Память в этом канале стёрта. Начинаем с чистого листа.", mention_author=False)
 
 
@@ -142,7 +185,7 @@ async def on_message(message: discord.Message):
     if not clean_text:
         clean_text = "Чего тебе?"
 
-    history = channel_history[message.channel.id]
+    history = get_channel_history(message.channel.id)
     history.append({"role": "user", "content": f"{message.author.display_name}: {clean_text}"})
 
     messages_payload = [{"role": "system", "content": current_system_prompt}, *history]
@@ -171,6 +214,8 @@ async def on_message(message: discord.Message):
             for chunk in split_message(reply_text):
                 await message.reply(chunk, mention_author=False)
 
+        except asyncio.TimeoutError:
+            await message.reply("Сервер нейросети слишком долго думал и отвалился по таймауту. Попробуй ещё раз.")
         except Exception as e:
             await message.reply(f"Ошибка при обращении к API: `{e}`")
 
@@ -178,4 +223,11 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not API_KEY:
         raise ValueError("Не заданы переменные окружения DISCORD_TOKEN и API_KEY!")
-    bot.run(DISCORD_TOKEN)
+
+    # Бесконечный цикл перезапуска на случай критического разрыва сессии
+    while True:
+        try:
+            bot.run(DISCORD_TOKEN, reconnect=True)
+        except Exception as e:
+            print(f"[CRITICAL] Сессия бота упала ({e}). Перезапуск через 5 секунд...")
+            time.sleep(5)
