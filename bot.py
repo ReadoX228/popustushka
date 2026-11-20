@@ -124,6 +124,24 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         print(f"[ERROR] Ошибка команды: {error}")
 
 
+@bot.command(name="commands")
+async def show_commands(ctx: commands.Context):
+    """Отправляет список всех команд бота."""
+    commands_text = (
+        "**Список команд бота:**\n\n"
+        "**Общение (для всех):**\n"
+        f"• **Упоминание ({bot.user.mention} текст)** или **Reply** на сообщение бота — пообщаться с нейросетью в канале.\n"
+        "• **Личные сообщения (ЛС)** — пиши любой текст напрямую без упоминаний.\n"
+        "• **`!commands`** — показать этот список команд.\n\n"
+        "**Управление (только для создателя и админов):**\n"
+        "• **`!clear`** — очистить память диалога бота в текущем канале.\n"
+        "• **`!prompt`** — посмотреть текущий системный промпт.\n"
+        "• **`!prompt <текст>`** — задать новый характер/промпт нейросети (сбрасывает историю).\n"
+        "• **`!prompt reset`** — вернуть стандартный промпт по умолчанию."
+    )
+    await ctx.reply(commands_text, mention_author=False)
+
+
 @bot.command(name="clear")
 @is_admin_or_owner()
 async def clear_history(ctx: commands.Context):
