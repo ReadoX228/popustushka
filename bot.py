@@ -13,7 +13,6 @@ load_dotenv(override=True)
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 API_KEY = (os.getenv("API_KEY") or "").strip()
 
-# Очищаем BASE_URL от пробелов, кавычек и случайной Markdown-разметки вида url](url)
 raw_env_url = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().strip("\"'")
 RAW_BASE_URL = re.split(r"[\]\(\s]", raw_env_url)[0].rstrip("/")
 
@@ -71,7 +70,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Ограничиваем память 100 активными каналами для стабильной работы 24/7
 MAX_CHANNELS = 100
 channel_history: OrderedDict[int, deque] = OrderedDict()
 
@@ -109,6 +107,14 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
+async def safe_send(message: discord.Message, text: str):
+    """Отправляет reply, а при нехватке прав на историю сообщений — обычное сообщение."""
+    try:
+        await message.reply(text, mention_author=False)
+    except discord.Forbidden:
+        await message.channel.send(f"{message.author.mention} {text}")
+
+
 async def resolve_working_endpoint_and_models() -> tuple[str, list[str], list[str]]:
     """Находит рабочий BASE_URL и собирает диагностику по всем проверенным адресам."""
     global active_base_url, ai_client
@@ -137,7 +143,6 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
     """Отправляет запрос, при 404/502/503 автоматически переключается на живую модель или маршрут."""
     global active_model, active_base_url, ai_client
 
-    # 1. Пробуем текущие активные URL и модель
     try:
         response = await ai_client.chat.completions.create(
             model=active_model,
@@ -151,7 +156,6 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
         if status not in (404, 502, 503):
             raise
 
-    # 2. Если получили 404/502/503 — ищем рабочий эндпоинт и актуальные модели
     _, available_models, _ = await resolve_working_endpoint_and_models()
 
     candidates = []
@@ -317,17 +321,40 @@ async def on_message(message: discord.Message):
         return
 
     is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mentioned = bot.user in message.mentions
-    is_reply_to_bot = (
-        message.reference is not None
-        and message.reference.resolved is not None
-        and getattr(message.reference.resolved, "author", None) == bot.user
-    )
+    is_user_mentioned = bot.user in message.mentions
 
-    if not (is_dm or is_mentioned or is_reply_to_bot):
+    # Проверяем, не тегнули ли одноимённую роль бота вместо самого пользователя бота
+    is_bot_role_mentioned = False
+    if message.guild and message.role_mentions:
+        bot_member = message.guild.me
+        if bot_member:
+            bot_roles = set(bot_member.roles)
+            is_bot_role_mentioned = any(
+                role in bot_roles and (role.is_bot_managed() or role.name == bot.user.name)
+                for role in message.role_mentions
+            )
+
+    # Проверяем Reply (в том числе на старые сообщения бота, которых нет в кэше)
+    is_reply_to_bot = False
+    if message.reference is not None:
+        if message.reference.resolved is not None:
+            is_reply_to_bot = getattr(message.reference.resolved, "author", None) == bot.user
+        elif message.reference.message_id:
+            try:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                is_reply_to_bot = ref_msg.author == bot.user
+            except Exception:
+                pass
+
+    if not (is_dm or is_user_mentioned or is_bot_role_mentioned or is_reply_to_bot):
         return
 
-    clean_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    # Вырезаем упоминание пользователя и роли бота из текста
+    clean_text = re.sub(rf"<@!?{bot.user.id}>", "", message.content)
+    for role in message.role_mentions:
+        clean_text = clean_text.replace(f"<@&{role.id}>", "")
+    clean_text = clean_text.strip()
+
     if not clean_text:
         clean_text = "Чего тебе?"
 
@@ -355,19 +382,18 @@ async def on_message(message: discord.Message):
             history.append({"role": "assistant", "content": reply_text})
 
             for chunk in split_message(reply_text):
-                await message.reply(chunk, mention_author=False)
+                await safe_send(message, chunk)
 
         except asyncio.TimeoutError:
-            await message.reply("Сервер нейросети слишком долго думал и отвалился по таймауту. Попробуй ещё раз.")
+            await safe_send(message, "Сервер нейросети слишком долго думал и отвалился по таймауту. Попробуй ещё раз.")
         except Exception as e:
-            await message.reply(f"Ошибка при обращении к API: `{e}`")
+            await safe_send(message, f"Ошибка при обращении к API: `{e}`")
 
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not API_KEY:
         raise ValueError("Не заданы переменные окружения DISCORD_TOKEN и API_KEY!")
 
-    # Бесконечный цикл перезапуска для круглосуточной работы 24/7
     while True:
         try:
             bot.run(DISCORD_TOKEN, reconnect=True)
