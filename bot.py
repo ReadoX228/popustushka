@@ -208,55 +208,176 @@ async def download_image_bytes(url: str) -> bytes:
             return await resp.read()
 
 
-async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attachment]) -> bytes:
-    """Генерирует изображение через flux-2-dev (с референсами или без)."""
-    img_client = make_client(active_base_url, timeout_sec=120.0)
+async def extract_image_from_api_json(data: dict) -> bytes | None:
+    """Извлекает байты изображения из JSON-ответа OpenAI/Flux/Chat форматов."""
+    # 1. Стандартный формат data: [{"url": ...} | {"b64_json": ...}]
+    items = data.get("data")
+    if isinstance(items, list) and items:
+        first = items[0]
+        if isinstance(first, dict):
+            if first.get("b64_json"):
+                return base64.b64decode(first["b64_json"])
+            if first.get("url"):
+                return await download_image_bytes(first["url"])
 
-    if ref_attachments:
-        image_files = []
-        for idx, att in enumerate(ref_attachments, start=1):
-            raw_bytes = await att.read()
-            filename = att.filename or f"ref_{idx}.png"
-            content_type = att.content_type or "image/png"
-            image_files.append((filename, raw_bytes, content_type))
+    # 2. Прямые поля верхнего уровня (url / image / output)
+    for key in ("b64_json", "image_base64", "base64"):
+        if isinstance(data.get(key), str) and data[key]:
+            b64_str = data[key].split(",")[-1]
+            return base64.b64decode(b64_str)
+
+    for key in ("url", "image_url", "image"):
+        val = data.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return await download_image_bytes(val)
+
+    output = data.get("output")
+    if isinstance(output, list) and output and isinstance(output[0], str) and output[0].startswith("http"):
+        return await download_image_bytes(output[0])
+    if isinstance(output, str) and output.startswith("http"):
+        return await download_image_bytes(output)
+
+    # 3. Ответ через choices[0].message (если провайдер оборачивает генерацию в chat/completions)
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message", {})
+        images = msg.get("images")
+        if isinstance(images, list) and images:
+            img_obj = images[0]
+            if isinstance(img_obj, dict):
+                u = img_obj.get("image_url", {}).get("url") or img_obj.get("url")
+                if u:
+                    if u.startswith("data:image"):
+                        return base64.b64decode(u.split(",", 1)[1])
+                    if u.startswith("http"):
+                        return await download_image_bytes(u)
+
+        content = msg.get("content")
+        if isinstance(content, str):
+            data_uri_match = re.search(r"data:image/[a-zA-Z0-9+.-]+;base64,([A-Za-z0-9+/=]+)", content)
+            if data_uri_match:
+                return base64.b64decode(data_uri_match.group(1))
+            url_match = re.search(r"https?://[^\s\)\"']+\.(?:png|jpg|jpeg|webp)(?:\?[^\s\)\"']*)?", content, re.IGNORECASE)
+            if not url_match:
+                url_match = re.search(r"!\[.*?\]\((https?://[^\s\)]+)\)", content)
+            if url_match:
+                target_url = url_match.group(1) if url_match.lastindex else url_match.group(0)
+                return await download_image_bytes(target_url)
+
+    return None
+
+
+async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attachment]) -> bytes:
+    """Генерирует изображение через flux-2-dev с корректной передачей промпта и Base64-референсов."""
+    auth_headers = {
+        **DEFAULT_HEADERS,
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # Кодируем все референсы в Base64 Data URI (чтобы серверу не приходилось скачивать ссылки Discord)
+    data_uris: list[str] = []
+    raw_files: list[tuple[str, bytes, str]] = []
+    for idx, att in enumerate(ref_attachments, start=1):
+        raw_bytes = await att.read()
+        mime = att.content_type if (att.content_type and att.content_type.startswith("image/")) else "image/png"
+        filename = att.filename or f"ref_{idx}.png"
+        raw_files.append((filename, raw_bytes, mime))
+        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        data_uris.append(f"data:{mime};base64,{b64}")
+
+    timeout = aiohttp.ClientTimeout(total=120)
+    last_error = "Неизвестная ошибка при генерации."
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # 1. Если есть референсы — сначала пробуем multipart /images/edits (стандарт OpenAI для image-to-image)
+        if raw_files:
+            form = aiohttp.FormData()
+            form.add_field("model", IMAGE_MODEL)
+            form.add_field("prompt", prompt)
+            for idx, (fname, fbytes, fmime) in enumerate(raw_files):
+                field_name = "image" if len(raw_files) == 1 else "image[]"
+                form.add_field(field_name, fbytes, filename=fname, content_type=fmime)
+
+            try:
+                async with session.post(
+                    f"{active_base_url}/images/edits",
+                    headers={**DEFAULT_HEADERS, "Authorization": f"Bearer {API_KEY}"},
+                    data=form,
+                ) as resp:
+                    if resp.status == 200:
+                        res_json = await resp.json()
+                        img_bytes = await extract_image_from_api_json(res_json)
+                        if img_bytes:
+                            print(f"[INFO] {IMAGE_MODEL}: успешно через POST /images/edits (multipart, refs={len(raw_files)})")
+                            return img_bytes
+                    else:
+                        err_txt = await resp.text()
+                        last_error = f"/images/edits HTTP {resp.status}: {err_txt[:200]}"
+                        print(f"[WARN] {last_error}")
+            except Exception as e:
+                last_error = f"/images/edits exception: {e}"
+                print(f"[WARN] {last_error}")
+
+        # 2. Основной JSON-запрос в /images/generations (передаём prompt и Base64-референсы во всех стандартных полях Flux)
+        gen_payload: dict = {
+            "model": IMAGE_MODEL,
+            "prompt": prompt,
+            "n": 1,
+        }
+        if data_uris:
+            gen_payload["image"] = data_uris[0]
+            gen_payload["images"] = data_uris
+            gen_payload["image_urls"] = data_uris
+            gen_payload["reference_images"] = data_uris
 
         try:
-            img_input = image_files[0] if len(image_files) == 1 else image_files
-            response = await img_client.images.edit(
-                model=IMAGE_MODEL,
-                image=img_input,
-                prompt=prompt,
-            )
-            item = response.data[0]
-            if getattr(item, "b64_json", None):
-                return base64.b64decode(item.b64_json)
-            if getattr(item, "url", None):
-                return await download_image_bytes(item.url)
-        except Exception as edit_err:
-            print(f"[WARN] /images/edits не сработал ({edit_err}), пробуем через /images/generations...")
-            ref_urls = [att.url for att in ref_attachments]
-            response = await img_client.images.generate(
-                model=IMAGE_MODEL,
-                prompt=prompt,
-                extra_body={"image_urls": ref_urls, "images": ref_urls},
-            )
-            item = response.data[0]
-            if getattr(item, "b64_json", None):
-                return base64.b64decode(item.b64_json)
-            if getattr(item, "url", None):
-                return await download_image_bytes(item.url)
+            async with session.post(
+                f"{active_base_url}/images/generations",
+                headers=auth_headers,
+                json=gen_payload,
+            ) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    img_bytes = await extract_image_from_api_json(res_json)
+                    if img_bytes:
+                        print(f"[INFO] {IMAGE_MODEL}: успешно через POST /images/generations (JSON, refs={len(data_uris)})")
+                        return img_bytes
+                    last_error = f"API вернул 200, но картинка не найдена в ответе: {str(res_json)[:200]}"
+                else:
+                    err_txt = await resp.text()
+                    last_error = f"/images/generations HTTP {resp.status}: {err_txt[:200]}"
+                    print(f"[WARN] {last_error}")
+        except Exception as e:
+            last_error = f"/images/generations exception: {e}"
+            print(f"[WARN] {last_error}")
 
-    response = await img_client.images.generate(
-        model=IMAGE_MODEL,
-        prompt=prompt,
-    )
-    item = response.data[0]
-    if getattr(item, "b64_json", None):
-        return base64.b64decode(item.b64_json)
-    if getattr(item, "url", None):
-        return await download_image_bytes(item.url)
+        # 3. Резерв через мультимодальный /chat/completions (если провайдер принимает картинки только через messages)
+        if data_uris:
+            content_parts: list[dict] = [{"type": "text", "text": prompt}]
+            for uri in data_uris:
+                content_parts.append({"type": "image_url", "image_url": {"url": uri}})
 
-    raise RuntimeError("API вернул пустой ответ без изображения.")
+            chat_payload = {
+                "model": IMAGE_MODEL,
+                "messages": [{"role": "user", "content": content_parts}],
+            }
+            try:
+                async with session.post(
+                    f"{active_base_url}/chat/completions",
+                    headers=auth_headers,
+                    json=chat_payload,
+                ) as resp:
+                    if resp.status == 200:
+                        res_json = await resp.json()
+                        img_bytes = await extract_image_from_api_json(res_json)
+                        if img_bytes:
+                            print(f"[INFO] {IMAGE_MODEL}: успешно через POST /chat/completions (multimodal, refs={len(data_uris)})")
+                            return img_bytes
+            except Exception as e:
+                print(f"[WARN] /chat/completions fallback exception: {e}")
+
+    raise RuntimeError(last_error)
 
 
 @tasks.loop(minutes=3)
