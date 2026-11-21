@@ -12,13 +12,8 @@ load_dotenv(override=True)
 
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 API_KEY = (os.getenv("API_KEY") or "").strip()
-BASE_URL = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().rstrip("/")
-MODEL_NAME = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip()
-FALLBACK_MODEL = "logfare/auto"
-
-# Автоматически добавляем /v1, если в панели хостинга указали просто https://logfare.ai
-if BASE_URL and not BASE_URL.endswith("/v1"):
-    BASE_URL = f"{BASE_URL}/v1"
+RAW_BASE_URL = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().rstrip("/")
+PREFERRED_MODEL = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip()
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты играешь роль вымышленного персонажа в развлекательном Discord-чате: это циничный, "
@@ -39,17 +34,34 @@ REFUSAL_PHRASES = (
     "давай общаться уважительно",
 )
 
-# Маскируем User-Agent под обычный браузер, чтобы Cloudflare не резал запросы к API
-ai_client = AsyncOpenAI(
-    api_key=API_KEY,
-    base_url=BASE_URL,
-    timeout=45.0,
-    max_retries=2,
-    default_headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    },
-)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+# Возможные базовые URL на случай смены маршрутизации у провайдера
+CANDIDATE_BASE_URLS = list(dict.fromkeys([
+    RAW_BASE_URL if RAW_BASE_URL.endswith("/v1") else f"{RAW_BASE_URL}/v1",
+    "https://logfare.ai/v1",
+    "https://api.logfare.ai/v1",
+    "https://logfare.ai/api/v1",
+]))
+
+active_base_url = CANDIDATE_BASE_URLS[0]
+active_model = PREFERRED_MODEL
+
+
+def make_client(base_url: str) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=API_KEY,
+        base_url=base_url,
+        timeout=45.0,
+        max_retries=1,
+        default_headers=DEFAULT_HEADERS,
+    )
+
+
+ai_client = make_client(active_base_url)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -71,7 +83,6 @@ def get_channel_history(channel_id: int) -> deque:
 
 
 def is_admin_or_owner():
-    """Проверка: создатель (владелец) сервера или администратор."""
     async def predicate(ctx: commands.Context) -> bool:
         if ctx.guild is None:
             return False
@@ -83,47 +94,93 @@ def is_admin_or_owner():
 
 
 def clean_thinking(text: str) -> str:
-    """Удаляет блок рассуждений <think>...</think>, если модель его возвращает."""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     return cleaned if cleaned else text.strip()
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
-    """Разбивает длинный ответ на части по 2000 символов (лимит Discord)."""
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
-async def generate_with_fallback(messages_payload: list[dict], temperature: float) -> str:
-    """Пробует основную модель, при 404/503 автоматически переключается на logfare/auto."""
-    models_to_try = [MODEL_NAME]
-    if MODEL_NAME != FALLBACK_MODEL:
-        models_to_try.append(FALLBACK_MODEL)
+async def resolve_working_endpoint_and_models() -> tuple[str, list[str]]:
+    """Находит рабочий BASE_URL и получает актуальный список моделей с сервера."""
+    global active_base_url, ai_client
 
-    last_error = None
-    for current_model in models_to_try:
+    for url in CANDIDATE_BASE_URLS:
+        test_client = make_client(url)
+        try:
+            models_resp = await test_client.models.list()
+            model_ids = [m.id for m in getattr(models_resp, "data", []) if getattr(m, "id", None)]
+            if model_ids:
+                active_base_url = url
+                ai_client = test_client
+                print(f"[INFO] Рабочий эндпоинт найден: {url} (моделей: {len(model_ids)})")
+                return url, model_ids
+        except Exception as e:
+            print(f"[WARN] Эндпоинт {url}/models недоступен: {e}")
+
+    return active_base_url, []
+
+
+async def smart_chat_completion(messages_payload: list[dict], temperature: float) -> str:
+    """Отправляет запрос, при 404 сам находит рабочий эндпоинт и живую модель."""
+    global active_model
+
+    # 1. Сначала пробуем текущие активные URL и модель
+    try:
+        response = await ai_client.chat.completions.create(
+            model=active_model,
+            messages=messages_payload,
+            temperature=temperature,
+            max_tokens=1500,
+        )
+        return response.choices[0].message.content or ""
+    except (NotFoundError, APIStatusError) as e:
+        status = getattr(e, "status_code", None)
+        print(f"[WARN] Сбой на {active_base_url} / {active_model} (код {status}). Ищем рабочий маршрут...")
+        if status not in (404, 502, 503):
+            raise
+
+    # 2. Если получили 404/502/503 — запрашиваем у сервера живой список моделей
+    _, available_models = await resolve_working_endpoint_and_models()
+
+    # Формируем очередь моделей для перебора: желаемая -> qwen -> deepseek -> остальные
+    candidates = []
+    if PREFERRED_MODEL in available_models:
+        candidates.append(PREFERRED_MODEL)
+    for kw in ("qwen", "deepseek", "kimi", "glm"):
+        for m in available_models:
+            if kw in m.lower() and m not in candidates:
+                candidates.append(m)
+    for m in available_models:
+        if m not in candidates:
+            candidates.append(m)
+
+    if not candidates:
+        candidates = [PREFERRED_MODEL, "qwen-3.8-27b", "deepseek-v3", "deepseek-v4-flash"]
+
+    last_err = None
+    for candidate_model in candidates[:6]:
         try:
             response = await ai_client.chat.completions.create(
-                model=current_model,
+                model=candidate_model,
                 messages=messages_payload,
                 temperature=temperature,
                 max_tokens=1500,
             )
+            active_model = candidate_model
+            print(f"[INFO] Переключено на рабочую модель: {active_model}")
             return response.choices[0].message.content or ""
         except (NotFoundError, APIStatusError) as e:
-            last_error = e
-            status = getattr(e, "status_code", None)
-            body_preview = getattr(e, "message", "")[:200]
-            print(f"[WARN] Ошибка {status} на модели {current_model} ({BASE_URL}/chat/completions): {body_preview}")
-            if status in (404, 502, 503):
-                continue
-            raise
+            last_err = e
+            print(f"[WARN] Модель {candidate_model} не ответила ({getattr(e, 'status_code', e)})")
+            continue
 
-    raise last_error
+    raise last_err or RuntimeError("Ни одна из моделей API не ответила (404).")
 
 
 @tasks.loop(minutes=3)
 async def keep_alive_loop():
-    """Периодическая проверка соединения со шлюзом Discord."""
     await bot.wait_until_ready()
     if bot.is_closed():
         return
@@ -138,7 +195,9 @@ async def keep_alive_loop():
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
-    print(f"Основная модель: {MODEL_NAME} | Резерв: {FALLBACK_MODEL} | URL: {BASE_URL}")
+    url, models = await resolve_working_endpoint_and_models()
+    if models:
+        print(f"[INFO] Доступные модели: {', '.join(models[:10])}")
     if not keep_alive_loop.is_running():
         keep_alive_loop.start()
 
@@ -163,7 +222,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @bot.command(name="commands")
 async def show_commands(ctx: commands.Context):
-    """Отправляет список всех команд бота."""
     commands_text = (
         "**Список команд бота:**\n\n"
         "**Общение (для всех):**\n"
@@ -182,7 +240,6 @@ async def show_commands(ctx: commands.Context):
 @bot.command(name="clear")
 @is_admin_or_owner()
 async def clear_history(ctx: commands.Context):
-    """Очищает память бота в текущем канале."""
     get_channel_history(ctx.channel.id).clear()
     await ctx.reply("Память в этом канале стёрта. Начинаем с чистого листа.", mention_author=False)
 
@@ -190,7 +247,6 @@ async def clear_history(ctx: commands.Context):
 @bot.command(name="prompt")
 @is_admin_or_owner()
 async def set_prompt(ctx: commands.Context, *, new_prompt: str = None):
-    """Меняет системный промпт бота."""
     global current_system_prompt
 
     if not new_prompt:
@@ -249,7 +305,7 @@ async def on_message(message: discord.Message):
         try:
             reply_text = ""
             for attempt in range(2):
-                raw_reply = await generate_with_fallback(
+                raw_reply = await smart_chat_completion(
                     messages_payload=messages_payload,
                     temperature=0.9 + (attempt * 0.15),
                 )
