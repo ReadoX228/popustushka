@@ -21,7 +21,7 @@ raw_env_url = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().strip("
 RAW_BASE_URL = re.split(r"[\]\(\s]", raw_env_url)[0].rstrip("/")
 
 PREFERRED_MODEL = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip().strip("\"'")
-IMAGE_MODEL = (os.getenv("IMAGE_MODEL") or "flux-2-dev").strip().strip("\"'")
+DEFAULT_IMAGE_MODEL = (os.getenv("IMAGE_MODEL") or "flux-2-dev").strip().strip("\"'")
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты играешь роль вымышленного персонажа в развлекательном Discord-чате: это циничный, "
@@ -200,6 +200,44 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
     raise last_err or APITimeoutError(request=None)
 
 
+async def translate_prompt_to_english(prompt: str, ref_count: int) -> str:
+    """Переводит русский промпт в точный английский промпт для Flux (если он содержит кириллицу)."""
+    if not re.search(r"[а-яА-ЯёЁ]", prompt):
+        return prompt
+
+    ref_hint = (
+        f" The user attached {ref_count} reference image(s) (image 1, image 2, etc.) — preserve references to them accurately."
+        if ref_count > 0
+        else ""
+    )
+    sys_msg = (
+        "You are an expert prompt translator for FLUX.2 image generation. "
+        "Translate the user's image prompt from Russian into clear, detailed, natural English "
+        "preserving every object, style, action, and detail without censoring or lecturing."
+        f"{ref_hint} Return ONLY the translated English prompt text, nothing else."
+    )
+
+    try:
+        fast_client = make_client(active_base_url, timeout_sec=15.0)
+        resp = await fast_client.chat.completions.create(
+            model="logfare/auto",
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=300,
+        )
+        translated = clean_thinking(resp.choices[0].message.content or "").strip("\"'` \n")
+        if translated and len(translated) >= 5:
+            print(f"[INFO] Промпт переведён для Flux: {translated}")
+            return translated
+    except Exception as e:
+        print(f"[WARN] Автоперевод промпта пропущен ({e}), используем оригинал.")
+
+    return prompt
+
+
 async def download_image_bytes(url: str) -> bytes:
     """Скачивает сгенерированное изображение по URL."""
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
@@ -210,7 +248,6 @@ async def download_image_bytes(url: str) -> bytes:
 
 async def extract_image_from_api_json(data: dict) -> bytes | None:
     """Извлекает байты изображения из JSON-ответа OpenAI/Flux/Chat форматов."""
-    # 1. Стандартный формат data: [{"url": ...} | {"b64_json": ...}]
     items = data.get("data")
     if isinstance(items, list) and items:
         first = items[0]
@@ -220,7 +257,6 @@ async def extract_image_from_api_json(data: dict) -> bytes | None:
             if first.get("url"):
                 return await download_image_bytes(first["url"])
 
-    # 2. Прямые поля верхнего уровня (url / image / output)
     for key in ("b64_json", "image_base64", "base64"):
         if isinstance(data.get(key), str) and data[key]:
             b64_str = data[key].split(",")[-1]
@@ -237,7 +273,6 @@ async def extract_image_from_api_json(data: dict) -> bytes | None:
     if isinstance(output, str) and output.startswith("http"):
         return await download_image_bytes(output)
 
-    # 3. Ответ через choices[0].message (если провайдер оборачивает генерацию в chat/completions)
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         msg = choices[0].get("message", {})
@@ -267,15 +302,18 @@ async def extract_image_from_api_json(data: dict) -> bytes | None:
     return None
 
 
-async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attachment]) -> bytes:
-    """Генерирует изображение через flux-2-dev с корректной передачей промпта и Base64-референсов."""
+async def generate_flux2_image(
+    prompt: str,
+    ref_attachments: list[discord.Attachment],
+    image_model: str = DEFAULT_IMAGE_MODEL,
+) -> bytes:
+    """Генерирует изображение через выбранную модель Flux с передачей промпта и Base64-референсов."""
     auth_headers = {
         **DEFAULT_HEADERS,
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     }
 
-    # Кодируем все референсы в Base64 Data URI (чтобы серверу не приходилось скачивать ссылки Discord)
     data_uris: list[str] = []
     raw_files: list[tuple[str, bytes, str]] = []
     for idx, att in enumerate(ref_attachments, start=1):
@@ -290,12 +328,12 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
     last_error = "Неизвестная ошибка при генерации."
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # 1. Если есть референсы — сначала пробуем multipart /images/edits (стандарт OpenAI для image-to-image)
+        # 1. Если есть референсы — сначала пробуем multipart /images/edits
         if raw_files:
             form = aiohttp.FormData()
-            form.add_field("model", IMAGE_MODEL)
+            form.add_field("model", image_model)
             form.add_field("prompt", prompt)
-            for idx, (fname, fbytes, fmime) in enumerate(raw_files):
+            for fname, fbytes, fmime in raw_files:
                 field_name = "image" if len(raw_files) == 1 else "image[]"
                 form.add_field(field_name, fbytes, filename=fname, content_type=fmime)
 
@@ -309,7 +347,7 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
                         res_json = await resp.json()
                         img_bytes = await extract_image_from_api_json(res_json)
                         if img_bytes:
-                            print(f"[INFO] {IMAGE_MODEL}: успешно через POST /images/edits (multipart, refs={len(raw_files)})")
+                            print(f"[INFO] {image_model}: успешно через POST /images/edits (multipart, refs={len(raw_files)})")
                             return img_bytes
                     else:
                         err_txt = await resp.text()
@@ -319,9 +357,9 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
                 last_error = f"/images/edits exception: {e}"
                 print(f"[WARN] {last_error}")
 
-        # 2. Основной JSON-запрос в /images/generations (передаём prompt и Base64-референсы во всех стандартных полях Flux)
+        # 2. JSON-запрос в /images/generations с передачей prompt и Base64-референсов
         gen_payload: dict = {
-            "model": IMAGE_MODEL,
+            "model": image_model,
             "prompt": prompt,
             "n": 1,
         }
@@ -341,7 +379,7 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
                     res_json = await resp.json()
                     img_bytes = await extract_image_from_api_json(res_json)
                     if img_bytes:
-                        print(f"[INFO] {IMAGE_MODEL}: успешно через POST /images/generations (JSON, refs={len(data_uris)})")
+                        print(f"[INFO] {image_model}: успешно через POST /images/generations (JSON, refs={len(data_uris)})")
                         return img_bytes
                     last_error = f"API вернул 200, но картинка не найдена в ответе: {str(res_json)[:200]}"
                 else:
@@ -352,14 +390,14 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
             last_error = f"/images/generations exception: {e}"
             print(f"[WARN] {last_error}")
 
-        # 3. Резерв через мультимодальный /chat/completions (если провайдер принимает картинки только через messages)
+        # 3. Мультимодальный резерв через /chat/completions
         if data_uris:
             content_parts: list[dict] = [{"type": "text", "text": prompt}]
             for uri in data_uris:
                 content_parts.append({"type": "image_url", "image_url": {"url": uri}})
 
             chat_payload = {
-                "model": IMAGE_MODEL,
+                "model": image_model,
                 "messages": [{"role": "user", "content": content_parts}],
             }
             try:
@@ -372,7 +410,7 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
                         res_json = await resp.json()
                         img_bytes = await extract_image_from_api_json(res_json)
                         if img_bytes:
-                            print(f"[INFO] {IMAGE_MODEL}: успешно через POST /chat/completions (multimodal, refs={len(data_uris)})")
+                            print(f"[INFO] {image_model}: успешно через POST /chat/completions (multimodal, refs={len(data_uris)})")
                             return img_bytes
             except Exception as e:
                 print(f"[WARN] /chat/completions fallback exception: {e}")
@@ -433,12 +471,20 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 # ==================== СЛЕШ-КОМАНДА /flux2 ====================
 
-@bot.tree.command(name="flux2", description="Сгенерировать изображение через flux-2-dev")
+@bot.tree.command(name="flux2", description="Сгенерировать изображение через FLUX.2 (с автопереводом промпта)")
 @app_commands.describe(
-    prompt="Описание картинки (минимум 10 символов)",
+    prompt="Описание картинки (минимум 10 символов, можно на русском)",
     image1="Референс-изображение 1 (необязательно)",
     image2="Референс-изображение 2 (необязательно)",
     image3="Референс-изображение 3 (необязательно)",
+    model="Выбор модели FLUX (по умолчанию flux-2-dev)",
+)
+@app_commands.choices(
+    model=[
+        app_commands.Choice(name="flux-2-dev (Макс. качество и референсы)", value="flux-2-dev"),
+        app_commands.Choice(name="flux-2-klein-9b (Быстро + хорошее качество)", value="flux-2-klein-9b"),
+        app_commands.Choice(name="flux-2-klein-4b (Максимально быстро)", value="flux-2-klein-4b"),
+    ]
 )
 async def flux2_command(
     interaction: discord.Interaction,
@@ -446,6 +492,7 @@ async def flux2_command(
     image1: discord.Attachment | None = None,
     image2: discord.Attachment | None = None,
     image3: discord.Attachment | None = None,
+    model: app_commands.Choice[str] | None = None,
 ):
     clean_prompt = prompt.strip()
     if len(clean_prompt) < 10:
@@ -466,20 +513,24 @@ async def flux2_command(
                 return
             refs.append(att)
 
+    selected_model = model.value if model else DEFAULT_IMAGE_MODEL
     await interaction.response.defer(thinking=True)
 
     try:
-        image_bytes = await generate_flux2_image(clean_prompt, refs)
+        en_prompt = await translate_prompt_to_english(clean_prompt, len(refs))
+        image_bytes = await generate_flux2_image(en_prompt, refs, image_model=selected_model)
         file = discord.File(fp=io.BytesIO(image_bytes), filename="flux2_result.png")
 
         refs_info = f" | Референсов: {len(refs)}" if refs else ""
-        short_prompt = clean_prompt if len(clean_prompt) <= 300 else f"{clean_prompt[:297]}..."
-        await interaction.followup.send(
-            content=f"🎨 **Модель:** `{IMAGE_MODEL}`{refs_info}\n**Промпт:** `{short_prompt}`",
-            file=file,
-        )
+        short_orig = clean_prompt if len(clean_prompt) <= 220 else f"{clean_prompt[:217]}..."
+        caption = f"🎨 **Модель:** `{selected_model}`{refs_info}\n**Промпт:** `{short_orig}`"
+        if en_prompt != clean_prompt:
+            short_en = en_prompt if len(en_prompt) <= 220 else f"{en_prompt[:217]}..."
+            caption += f"\n**EN-промпт:** `{short_en}`"
+
+        await interaction.followup.send(content=caption, file=file)
     except (asyncio.TimeoutError, APITimeoutError):
-        await interaction.followup.send("⏳ Сервер генерации изображений не успел ответить по таймауту. Попробуй ещё раз.")
+        await interaction.followup.send("⏳ Сервер генерации изображений не успел ответить по таймауту. Попробуй модель `flux-2-klein-9b` или повтори запрос.")
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка при генерации изображения: `{e}`")
 
@@ -512,7 +563,7 @@ async def debug_api(ctx: commands.Context):
             + "\n".join(diag)
             + f"\n\n**Активный URL:** `{url}`\n"
             + f"**Текстовая модель:** `{active_model}`\n"
-            + f"**Модель картинок:** `{IMAGE_MODEL}`\n"
+            + f"**Модель картинок:** `{DEFAULT_IMAGE_MODEL}`\n"
             + f"**Найденные модели:** `{models_preview}`"
         )
         await ctx.reply(report, mention_author=False)
@@ -526,7 +577,7 @@ async def show_commands(ctx: commands.Context):
         "**Общение и генерация (для всех):**\n"
         f"• **Упоминание ({bot.user.mention} текст)** или **Reply** на сообщение бота — пообщаться с нейросетью (`{PREFERRED_MODEL}`).\n"
         "• **Личные сообщения (ЛС)** — пиши любой текст напрямую без упоминаний.\n"
-        "• **`/flux2 prompt:<текст> [image1] [image2] [image3]`** — сгенерировать картинку через `flux-2-dev` (минимум 10 символов, до 3 референсов).\n"
+        "• **`/flux2 prompt:<текст> [image1] [image2] [image3] [model]`** — сгенерировать картинку через FLUX.2 (минимум 10 символов, до 3 референсов, автоперевод на EN).\n"
         "• **`!commands`** — показать этот список команд.\n\n"
         "**Управление (только для создателя и админов):**\n"
         "• **`!clear`** — очистить память диалога бота в текущем канале.\n"
