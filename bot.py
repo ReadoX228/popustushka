@@ -10,12 +10,15 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# .strip() защищает от случайных пробелов при копировании в панель хостинга
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 API_KEY = (os.getenv("API_KEY") or "").strip()
-BASE_URL = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip()
+BASE_URL = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().rstrip("/")
 MODEL_NAME = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip()
 FALLBACK_MODEL = "logfare/auto"
+
+# Автоматически добавляем /v1, если в панели хостинга указали просто https://logfare.ai
+if BASE_URL and not BASE_URL.endswith("/v1"):
+    BASE_URL = f"{BASE_URL}/v1"
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты играешь роль вымышленного персонажа в развлекательном Discord-чате: это циничный, "
@@ -36,11 +39,16 @@ REFUSAL_PHRASES = (
     "давай общаться уважительно",
 )
 
+# Маскируем User-Agent под обычный браузер, чтобы Cloudflare не резал запросы к API
 ai_client = AsyncOpenAI(
     api_key=API_KEY,
     base_url=BASE_URL,
     timeout=45.0,
     max_retries=2,
+    default_headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    },
 )
 
 intents = discord.Intents.default()
@@ -103,8 +111,10 @@ async def generate_with_fallback(messages_payload: list[dict], temperature: floa
             return response.choices[0].message.content or ""
         except (NotFoundError, APIStatusError) as e:
             last_error = e
-            if getattr(e, "status_code", None) in (404, 502, 503):
-                print(f"[WARN] Модель {current_model} вернула {e.status_code}, пробуем резерв...")
+            status = getattr(e, "status_code", None)
+            body_preview = getattr(e, "message", "")[:200]
+            print(f"[WARN] Ошибка {status} на модели {current_model} ({BASE_URL}/chat/completions): {body_preview}")
+            if status in (404, 502, 503):
                 continue
             raise
 
