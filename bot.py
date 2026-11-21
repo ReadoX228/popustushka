@@ -1,9 +1,13 @@
 import os
 import re
+import io
 import time
+import base64
 import asyncio
 from collections import OrderedDict, deque
+import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from openai import AsyncOpenAI, NotFoundError, APIStatusError, APITimeoutError
 from dotenv import load_dotenv
@@ -17,6 +21,7 @@ raw_env_url = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().strip("
 RAW_BASE_URL = re.split(r"[\]\(\s]", raw_env_url)[0].rstrip("/")
 
 PREFERRED_MODEL = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip().strip("\"'")
+IMAGE_MODEL = (os.getenv("IMAGE_MODEL") or "flux-2-dev").strip().strip("\"'")
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты играешь роль вымышленного персонажа в развлекательном Discord-чате: это циничный, "
@@ -55,7 +60,6 @@ active_model = PREFERRED_MODEL
 
 
 def make_client(base_url: str, timeout_sec: float = 90.0) -> AsyncOpenAI:
-    # max_retries=0 убирает скрытые повторные ожидания при тормозах бесплатного API
     return AsyncOpenAI(
         api_key=API_KEY,
         base_url=base_url,
@@ -145,7 +149,6 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
     """Отправляет запрос; при таймауте или 404/503 переключается на быстрый резерв."""
     global active_model, active_base_url, ai_client
 
-    # 1. Пробуем активную модель (таймаут 60 сек)
     try:
         fast_client = make_client(active_base_url, timeout_sec=60.0)
         response = await fast_client.chat.completions.create(
@@ -161,7 +164,6 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
         if isinstance(e, APIStatusError) and status not in (404, 429, 502, 503, 504):
             raise
 
-    # 2. Резервный быстрый запрос через logfare/auto (таймаут 35 сек)
     fallback_models = ["logfare/auto"]
     if active_model != PREFERRED_MODEL:
         fallback_models.append(PREFERRED_MODEL)
@@ -182,6 +184,69 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
             continue
 
     raise last_err or APITimeoutError(request=None)
+
+
+async def download_image_bytes(url: str) -> bytes:
+    """Скачивает сгенерированное изображение по URL."""
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            resp.raise_for_status()
+            return await resp.read()
+
+
+async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attachment]) -> bytes:
+    """Генерирует изображение через flux-2-dev (с референсами или без)."""
+    img_client = make_client(active_base_url, timeout_sec=120.0)
+
+    # Вариант 1: Если переданы референс-картинки (image1..image3)
+    if ref_attachments:
+        image_files = []
+        for idx, att in enumerate(ref_attachments, start=1):
+            raw_bytes = await att.read()
+            filename = att.filename or f"ref_{idx}.png"
+            content_type = att.content_type or "image/png"
+            image_files.append((filename, raw_bytes, content_type))
+
+        # Пробуем стандартный эндпоинт /images/edits с референсами
+        try:
+            img_input = image_files[0] if len(image_files) == 1 else image_files
+            response = await img_client.images.edit(
+                model=IMAGE_MODEL,
+                image=img_input,
+                prompt=prompt,
+            )
+            item = response.data[0]
+            if getattr(item, "b64_json", None):
+                return base64.b64decode(item.b64_json)
+            if getattr(item, "url", None):
+                return await download_image_bytes(item.url)
+        except Exception as edit_err:
+            print(f"[WARN] /images/edits не сработал ({edit_err}), пробуем через /images/generations с image_urls...")
+            # Резервный вариант для агрегаторов, принимающих референсы в extra_body
+            ref_urls = [att.url for att in ref_attachments]
+            response = await img_client.images.generate(
+                model=IMAGE_MODEL,
+                prompt=prompt,
+                extra_body={"image_urls": ref_urls, "images": ref_urls},
+            )
+            item = response.data[0]
+            if getattr(item, "b64_json", None):
+                return base64.b64decode(item.b64_json)
+            if getattr(item, "url", None):
+                return await download_image_bytes(item.url)
+
+    # Вариант 2: Обычная генерация по текстовому промпту (/images/generations)
+    response = await img_client.images.generate(
+        model=IMAGE_MODEL,
+        prompt=prompt,
+    )
+    item = response.data[0]
+    if getattr(item, "b64_json", None):
+        return base64.b64decode(item.b64_json)
+    if getattr(item, "url", None):
+        return await download_image_bytes(item.url)
+
+    raise RuntimeError("API вернул пустой ответ без изображения.")
 
 
 @tasks.loop(minutes=3)
@@ -206,6 +271,14 @@ async def on_ready():
         print(line)
     if models:
         print(f"[INFO] Доступные модели: {', '.join(models[:10])}")
+
+    # Синхронизируем слеш-команды (/flux2) с Discord
+    try:
+        synced = await bot.tree.sync()
+        print(f"[INFO] Синхронизировано слеш-команд: {len(synced)}")
+    except Exception as e:
+        print(f"[ERROR] Не удалось синхронизировать слеш-команды: {e}")
+
     if not keep_alive_loop.is_running():
         keep_alive_loop.start()
 
@@ -228,6 +301,62 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         print(f"[ERROR] Ошибка команды: {error}")
 
 
+# ==================== СЛЕШ-КОМАНДА /flux2 ====================
+
+@bot.tree.command(name="flux2", description="Сгенерировать изображение через flux-2-dev")
+@app_commands.describe(
+    prompt="Описание картинки (минимум 10 символов)",
+    image1="Референс-изображение 1 (необязательно)",
+    image2="Референс-изображение 2 (необязательно)",
+    image3="Референс-изображение 3 (необязательно)",
+)
+async def flux2_command(
+    interaction: discord.Interaction,
+    prompt: str,
+    image1: discord.Attachment | None = None,
+    image2: discord.Attachment | None = None,
+    image3: discord.Attachment | None = None,
+):
+    clean_prompt = prompt.strip()
+    if len(clean_prompt) < 10:
+        await interaction.response.send_message(
+            "❌ Промпт слишком короткий! Напиши минимум **10 символов**.",
+            ephemeral=True,
+        )
+        return
+
+    # Собираем переданные референсы и проверяем, что это картинки
+    refs: list[discord.Attachment] = []
+    for idx, att in enumerate((image1, image2, image3), start=1):
+        if att is not None:
+            if att.content_type and not att.content_type.startswith("image/"):
+                await interaction.response.send_message(
+                    f"❌ Вложение `image{idx}` должно быть изображением (PNG, JPG, WEBP).",
+                    ephemeral=True,
+                )
+                return
+            refs.append(att)
+
+    await interaction.response.defer(thinking=True)
+
+    try:
+        image_bytes = await generate_flux2_image(clean_prompt, refs)
+        file = discord.File(fp=io.BytesIO(image_bytes), filename="flux2_result.png")
+
+        refs_info = f" | Референсов: {len(refs)}" if refs else ""
+        short_prompt = clean_prompt if len(clean_prompt) <= 300 else f"{clean_prompt[:297]}..."
+        await interaction.followup.send(
+            content=f"🎨 **Модель:** `{IMAGE_MODEL}`{refs_info}\n**Промпт:** `{short_prompt}`",
+            file=file,
+        )
+    except (asyncio.TimeoutError, APITimeoutError):
+        await interaction.followup.send("⏳ Сервер генерации изображений не успел ответить по таймауту. Попробуй ещё раз.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при генерации изображения: `{e}`")
+
+
+# ==================== ТЕКСТОВЫЕ КОМАНДЫ ====================
+
 @bot.command(name="debug")
 @is_admin_or_owner()
 async def debug_api(ctx: commands.Context):
@@ -239,7 +368,8 @@ async def debug_api(ctx: commands.Context):
             "**Диагностика API с сервера хостинга:**\n"
             + "\n".join(diag)
             + f"\n\n**Активный URL:** `{url}`\n"
-            + f"**Активная модель:** `{active_model}`\n"
+            + f"**Текстовая модель:** `{active_model}`\n"
+            + f"**Модель картинок:** `{IMAGE_MODEL}`\n"
             + f"**Найденные модели:** `{models_preview}`"
         )
         await ctx.reply(report, mention_author=False)
@@ -250,9 +380,10 @@ async def show_commands(ctx: commands.Context):
     """Отправляет список всех команд бота."""
     commands_text = (
         "**Список команд бота:**\n\n"
-        "**Общение (для всех):**\n"
-        f"• **Упоминание ({bot.user.mention} текст)** или **Reply** на сообщение бота — пообщаться с нейросетью в канале.\n"
+        "**Общение и генерация (для всех):**\n"
+        f"• **Упоминание ({bot.user.mention} текст)** или **Reply** на сообщение бота — пообщаться с нейросетью (`{PREFERRED_MODEL}`).\n"
         "• **Личные сообщения (ЛС)** — пиши любой текст напрямую без упоминаний.\n"
+        "• **`/flux2 prompt:<текст> [image1] [image2] [image3]`** — сгенерировать картинку через `flux-2-dev` (минимум 10 символов, до 3 референсов).\n"
         "• **`!commands`** — показать этот список команд.\n\n"
         "**Управление (только для создателя и админов):**\n"
         "• **`!clear`** — очистить память диалога бота в текущем канале.\n"
