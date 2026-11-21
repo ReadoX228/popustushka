@@ -5,15 +5,17 @@ import asyncio
 from collections import OrderedDict, deque
 import discord
 from discord.ext import commands, tasks
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, NotFoundError, APIStatusError
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-API_KEY = os.getenv("API_KEY")
-BASE_URL = os.getenv("BASE_URL", "https://logfare.ai/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen-3.8-27b")
+# .strip() защищает от случайных пробелов при копировании в панель хостинга
+DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+API_KEY = (os.getenv("API_KEY") or "").strip()
+BASE_URL = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip()
+MODEL_NAME = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip()
+FALLBACK_MODEL = "logfare/auto"
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты играешь роль вымышленного персонажа в развлекательном Discord-чате: это циничный, "
@@ -46,7 +48,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Ограничиваем память 100 активными каналами, чтобы RAM на хостинге не забивалась
 MAX_CHANNELS = 100
 channel_history: OrderedDict[int, deque] = OrderedDict()
 
@@ -84,6 +85,32 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
+async def generate_with_fallback(messages_payload: list[dict], temperature: float) -> str:
+    """Пробует основную модель, при 404/503 автоматически переключается на logfare/auto."""
+    models_to_try = [MODEL_NAME]
+    if MODEL_NAME != FALLBACK_MODEL:
+        models_to_try.append(FALLBACK_MODEL)
+
+    last_error = None
+    for current_model in models_to_try:
+        try:
+            response = await ai_client.chat.completions.create(
+                model=current_model,
+                messages=messages_payload,
+                temperature=temperature,
+                max_tokens=1500,
+            )
+            return response.choices[0].message.content or ""
+        except (NotFoundError, APIStatusError) as e:
+            last_error = e
+            if getattr(e, "status_code", None) in (404, 502, 503):
+                print(f"[WARN] Модель {current_model} вернула {e.status_code}, пробуем резерв...")
+                continue
+            raise
+
+    raise last_error
+
+
 @tasks.loop(minutes=3)
 async def keep_alive_loop():
     """Периодическая проверка соединения со шлюзом Discord."""
@@ -101,7 +128,7 @@ async def keep_alive_loop():
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
-    print(f"Модель: {MODEL_NAME} | Эндпоинт: {BASE_URL}")
+    print(f"Основная модель: {MODEL_NAME} | Резерв: {FALLBACK_MODEL} | URL: {BASE_URL}")
     if not keep_alive_loop.is_running():
         keep_alive_loop.start()
 
@@ -212,13 +239,10 @@ async def on_message(message: discord.Message):
         try:
             reply_text = ""
             for attempt in range(2):
-                response = await ai_client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages_payload,
+                raw_reply = await generate_with_fallback(
+                    messages_payload=messages_payload,
                     temperature=0.9 + (attempt * 0.15),
-                    max_tokens=1500,
                 )
-                raw_reply = response.choices[0].message.content or ""
                 reply_text = clean_thinking(raw_reply)
 
                 if not any(phrase in reply_text.lower() for phrase in REFUSAL_PHRASES):
@@ -242,7 +266,6 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN or not API_KEY:
         raise ValueError("Не заданы переменные окружения DISCORD_TOKEN и API_KEY!")
 
-    # Бесконечный цикл перезапуска на случай критического разрыва сессии
     while True:
         try:
             bot.run(DISCORD_TOKEN, reconnect=True)
