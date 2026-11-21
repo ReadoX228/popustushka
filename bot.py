@@ -121,6 +121,20 @@ async def safe_send(message: discord.Message, text: str):
         await message.channel.send(f"{message.author.mention} {text}")
 
 
+async def sync_all_slash_commands() -> tuple[int, int]:
+    """Мгновенно синхронизирует слеш-команды для всех серверов и глобально."""
+    synced_global = await bot.tree.sync()
+    synced_guilds = 0
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            synced_guilds += 1
+        except Exception as e:
+            print(f"[WARN] Не удалось синхронизировать слеш-команды на сервере {guild.name} ({guild.id}): {e}")
+    return len(synced_global), synced_guilds
+
+
 async def resolve_working_endpoint_and_models() -> tuple[str, list[str], list[str]]:
     """Находит рабочий BASE_URL и собирает диагностику по всем проверенным адресам."""
     global active_base_url, ai_client
@@ -198,7 +212,6 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
     """Генерирует изображение через flux-2-dev (с референсами или без)."""
     img_client = make_client(active_base_url, timeout_sec=120.0)
 
-    # Вариант 1: Если переданы референс-картинки (image1..image3)
     if ref_attachments:
         image_files = []
         for idx, att in enumerate(ref_attachments, start=1):
@@ -207,7 +220,6 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
             content_type = att.content_type or "image/png"
             image_files.append((filename, raw_bytes, content_type))
 
-        # Пробуем стандартный эндпоинт /images/edits с референсами
         try:
             img_input = image_files[0] if len(image_files) == 1 else image_files
             response = await img_client.images.edit(
@@ -221,8 +233,7 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
             if getattr(item, "url", None):
                 return await download_image_bytes(item.url)
         except Exception as edit_err:
-            print(f"[WARN] /images/edits не сработал ({edit_err}), пробуем через /images/generations с image_urls...")
-            # Резервный вариант для агрегаторов, принимающих референсы в extra_body
+            print(f"[WARN] /images/edits не сработал ({edit_err}), пробуем через /images/generations...")
             ref_urls = [att.url for att in ref_attachments]
             response = await img_client.images.generate(
                 model=IMAGE_MODEL,
@@ -235,7 +246,6 @@ async def generate_flux2_image(prompt: str, ref_attachments: list[discord.Attach
             if getattr(item, "url", None):
                 return await download_image_bytes(item.url)
 
-    # Вариант 2: Обычная генерация по текстовому промпту (/images/generations)
     response = await img_client.images.generate(
         model=IMAGE_MODEL,
         prompt=prompt,
@@ -272,10 +282,9 @@ async def on_ready():
     if models:
         print(f"[INFO] Доступные модели: {', '.join(models[:10])}")
 
-    # Синхронизируем слеш-команды (/flux2) с Discord
     try:
-        synced = await bot.tree.sync()
-        print(f"[INFO] Синхронизировано слеш-команд: {len(synced)}")
+        cmd_count, guild_count = await sync_all_slash_commands()
+        print(f"[INFO] Синхронизировано слеш-команд: {cmd_count} (мгновенно для {guild_count} серверов)")
     except Exception as e:
         print(f"[ERROR] Не удалось синхронизировать слеш-команды: {e}")
 
@@ -325,7 +334,6 @@ async def flux2_command(
         )
         return
 
-    # Собираем переданные референсы и проверяем, что это картинки
     refs: list[discord.Attachment] = []
     for idx, att in enumerate((image1, image2, image3), start=1):
         if att is not None:
@@ -356,6 +364,20 @@ async def flux2_command(
 
 
 # ==================== ТЕКСТОВЫЕ КОМАНДЫ ====================
+
+@bot.command(name="sync")
+@is_admin_or_owner()
+async def sync_commands_cmd(ctx: commands.Context):
+    """Принудительно обновляет слеш-команды на сервере."""
+    try:
+        cmd_count, guild_count = await sync_all_slash_commands()
+        await ctx.reply(
+            f"✅ Слеш-команды обновлены (`{cmd_count}` шт. на `{guild_count}` серверах). Если не появились сразу — нажми `Ctrl + R` в Discord.",
+            mention_author=False,
+        )
+    except Exception as e:
+        await ctx.reply(f"❌ Ошибка синхронизации слеш-команд: `{e}`", mention_author=False)
+
 
 @bot.command(name="debug")
 @is_admin_or_owner()
@@ -390,6 +412,7 @@ async def show_commands(ctx: commands.Context):
         "• **`!prompt`** — посмотреть текущий системный промпт.\n"
         "• **`!prompt <текст>`** — задать новый характер/промпт нейросети (сбрасывает историю).\n"
         "• **`!prompt reset`** — вернуть стандартный промпт по умолчанию.\n"
+        "• **`!sync`** — принудительно обновить слеш-команды на сервере.\n"
         "• **`!debug`** — проверить соединение с сервером нейросети."
     )
     await ctx.reply(commands_text, mention_author=False)
