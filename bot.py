@@ -12,8 +12,12 @@ load_dotenv(override=True)
 
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 API_KEY = (os.getenv("API_KEY") or "").strip()
-RAW_BASE_URL = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().rstrip("/")
-PREFERRED_MODEL = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip()
+
+# Очищаем BASE_URL от пробелов, кавычек и случайной Markdown-разметки вида url](url)
+raw_env_url = (os.getenv("BASE_URL") or "https://logfare.ai/v1").strip().strip("\"'")
+RAW_BASE_URL = re.split(r"[\]\(\s]", raw_env_url)[0].rstrip("/")
+
+PREFERRED_MODEL = (os.getenv("MODEL_NAME") or "qwen-3.8-27b").strip().strip("\"'")
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты играешь роль вымышленного персонажа в развлекательном Discord-чате: это циничный, "
@@ -42,7 +46,6 @@ DEFAULT_HEADERS = {
 CANDIDATE_BASE_URLS = list(dict.fromkeys([
     RAW_BASE_URL,
     "https://logfare.ai/v1",
-    "https://logfare.ai",
     "https://api.logfare.ai/v1",
     "https://logfare.ai/api/v1",
 ]))
@@ -68,6 +71,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Ограничиваем память 100 активными каналами для стабильной работы 24/7
 MAX_CHANNELS = 100
 channel_history: OrderedDict[int, deque] = OrderedDict()
 
@@ -83,6 +87,7 @@ def get_channel_history(channel_id: int) -> deque:
 
 
 def is_admin_or_owner():
+    """Проверка: создатель (владелец) сервера или администратор."""
     async def predicate(ctx: commands.Context) -> bool:
         if ctx.guild is None:
             return False
@@ -94,11 +99,13 @@ def is_admin_or_owner():
 
 
 def clean_thinking(text: str) -> str:
+    """Удаляет блок рассуждений <think>...</think>, если модель его возвращает."""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     return cleaned if cleaned else text.strip()
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
+    """Разбивает длинный ответ на части по 2000 символов (лимит Discord)."""
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
@@ -127,7 +134,7 @@ async def resolve_working_endpoint_and_models() -> tuple[str, list[str], list[st
 
 
 async def smart_chat_completion(messages_payload: list[dict], temperature: float) -> str:
-    """Отправляет запрос, при 404 перебирает маршруты и живые модели."""
+    """Отправляет запрос, при 404/502/503 автоматически переключается на живую модель или маршрут."""
     global active_model, active_base_url, ai_client
 
     # 1. Пробуем текущие активные URL и модель
@@ -144,13 +151,13 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
         if status not in (404, 502, 503):
             raise
 
-    # 2. Ищем рабочий эндпоинт и модели
+    # 2. Если получили 404/502/503 — ищем рабочий эндпоинт и актуальные модели
     _, available_models, _ = await resolve_working_endpoint_and_models()
 
     candidates = []
     if PREFERRED_MODEL in available_models:
         candidates.append(PREFERRED_MODEL)
-    for kw in ("qwen", "deepseek", "kimi", "glm"):
+    for kw in ("qwen", "deepseek", "logfare/auto", "kimi", "glm"):
         for m in available_models:
             if kw in m.lower() and m not in candidates:
                 candidates.append(m)
@@ -159,12 +166,12 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
             candidates.append(m)
 
     if not candidates:
-        candidates = [PREFERRED_MODEL, "qwen-3.8-27b"]
+        candidates = [PREFERRED_MODEL, "qwen-3.8-27b", "logfare/auto"]
 
     last_err = None
     for url in CANDIDATE_BASE_URLS:
         client = make_client(url)
-        for candidate_model in candidates[:4]:
+        for candidate_model in candidates[:5]:
             try:
                 response = await client.chat.completions.create(
                     model=candidate_model,
@@ -185,6 +192,7 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
 
 @tasks.loop(minutes=3)
 async def keep_alive_loop():
+    """Периодическая проверка соединения со шлюзом Discord для работы 24/7."""
     await bot.wait_until_ready()
     if bot.is_closed():
         return
@@ -229,12 +237,12 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 @bot.command(name="debug")
 @is_admin_or_owner()
 async def debug_api(ctx: commands.Context):
-    """Проверяет доступность серверов API прямо с хостинга Bothost."""
+    """Проверяет доступность серверов API прямо с хостинга."""
     async with ctx.typing():
         url, models, diag = await resolve_working_endpoint_and_models()
         models_preview = ", ".join(models[:8]) if models else "не получены"
         report = (
-            "**Диагностика API с сервера Bothost:**\n"
+            "**Диагностика API с сервера хостинга:**\n"
             + "\n".join(diag)
             + f"\n\n**Активный URL:** `{url}`\n"
             + f"**Активная модель:** `{active_model}`\n"
@@ -245,6 +253,7 @@ async def debug_api(ctx: commands.Context):
 
 @bot.command(name="commands")
 async def show_commands(ctx: commands.Context):
+    """Отправляет список всех команд бота."""
     commands_text = (
         "**Список команд бота:**\n\n"
         "**Общение (для всех):**\n"
@@ -264,6 +273,7 @@ async def show_commands(ctx: commands.Context):
 @bot.command(name="clear")
 @is_admin_or_owner()
 async def clear_history(ctx: commands.Context):
+    """Очищает память бота в текущем канале."""
     get_channel_history(ctx.channel.id).clear()
     await ctx.reply("Память в этом канале стёрта. Начинаем с чистого листа.", mention_author=False)
 
@@ -271,6 +281,7 @@ async def clear_history(ctx: commands.Context):
 @bot.command(name="prompt")
 @is_admin_or_owner()
 async def set_prompt(ctx: commands.Context, *, new_prompt: str = None):
+    """Меняет системный промпт бота."""
     global current_system_prompt
 
     if not new_prompt:
@@ -356,6 +367,7 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN or not API_KEY:
         raise ValueError("Не заданы переменные окружения DISCORD_TOKEN и API_KEY!")
 
+    # Бесконечный цикл перезапуска для круглосуточной работы 24/7
     while True:
         try:
             bot.run(DISCORD_TOKEN, reconnect=True)
