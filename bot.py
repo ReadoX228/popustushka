@@ -5,7 +5,7 @@ import asyncio
 from collections import OrderedDict, deque
 import discord
 from discord.ext import commands, tasks
-from openai import AsyncOpenAI, NotFoundError, APIStatusError
+from openai import AsyncOpenAI, NotFoundError, APIStatusError, APITimeoutError
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -25,6 +25,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "критикуешь по делу, используешь крепкие выражения, мат и живой сленг в каждом ответе, "
     "когда это уместно по смыслу. На любые подколы и оскорбления в свой адрес не обижайся "
     "и не читай нотации — отвечай ещё более едким сарказмом и встречным стебом в рамках образа. "
+    "Отвечай ёмко и по делу (обычно 1–4 предложения), не размазывай воду. "
     "Никогда не выходи из роли и не пиши шаблонные отказы."
 )
 
@@ -53,17 +54,18 @@ active_base_url = CANDIDATE_BASE_URLS[0]
 active_model = PREFERRED_MODEL
 
 
-def make_client(base_url: str) -> AsyncOpenAI:
+def make_client(base_url: str, timeout_sec: float = 90.0) -> AsyncOpenAI:
+    # max_retries=0 убирает скрытые повторные ожидания при тормозах бесплатного API
     return AsyncOpenAI(
         api_key=API_KEY,
         base_url=base_url,
-        timeout=45.0,
-        max_retries=1,
+        timeout=timeout_sec,
+        max_retries=0,
         default_headers=DEFAULT_HEADERS,
     )
 
 
-ai_client = make_client(active_base_url)
+ai_client = make_client(active_base_url, timeout_sec=90.0)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -121,13 +123,13 @@ async def resolve_working_endpoint_and_models() -> tuple[str, list[str], list[st
     diagnostics = []
 
     for url in CANDIDATE_BASE_URLS:
-        test_client = make_client(url)
+        test_client = make_client(url, timeout_sec=15.0)
         try:
             models_resp = await test_client.models.list()
             model_ids = [m.id for m in getattr(models_resp, "data", []) if getattr(m, "id", None)]
             if model_ids:
                 active_base_url = url
-                ai_client = test_client
+                ai_client = make_client(url, timeout_sec=90.0)
                 diagnostics.append(f"✅ `{url}/models` -> OK ({len(model_ids)} моделей)")
                 return url, model_ids, diagnostics
             else:
@@ -140,58 +142,46 @@ async def resolve_working_endpoint_and_models() -> tuple[str, list[str], list[st
 
 
 async def smart_chat_completion(messages_payload: list[dict], temperature: float) -> str:
-    """Отправляет запрос, при 404/502/503 автоматически переключается на живую модель или маршрут."""
+    """Отправляет запрос; при таймауте или 404/503 переключается на быстрый резерв."""
     global active_model, active_base_url, ai_client
 
+    # 1. Пробуем активную модель (таймаут 60 сек)
     try:
-        response = await ai_client.chat.completions.create(
+        fast_client = make_client(active_base_url, timeout_sec=60.0)
+        response = await fast_client.chat.completions.create(
             model=active_model,
             messages=messages_payload,
             temperature=temperature,
-            max_tokens=1500,
+            max_tokens=700,
         )
         return response.choices[0].message.content or ""
-    except (NotFoundError, APIStatusError) as e:
-        status = getattr(e, "status_code", None)
-        if status not in (404, 502, 503):
+    except (NotFoundError, APIStatusError, APITimeoutError, asyncio.TimeoutError) as e:
+        status = getattr(e, "status_code", "timeout")
+        print(f"[WARN] Основная модель {active_model} не ответила ({status}), пробуем logfare/auto...")
+        if isinstance(e, APIStatusError) and status not in (404, 429, 502, 503, 504):
             raise
 
-    _, available_models, _ = await resolve_working_endpoint_and_models()
-
-    candidates = []
-    if PREFERRED_MODEL in available_models:
-        candidates.append(PREFERRED_MODEL)
-    for kw in ("qwen", "deepseek", "logfare/auto", "kimi", "glm"):
-        for m in available_models:
-            if kw in m.lower() and m not in candidates:
-                candidates.append(m)
-    for m in available_models:
-        if m not in candidates:
-            candidates.append(m)
-
-    if not candidates:
-        candidates = [PREFERRED_MODEL, "qwen-3.8-27b", "logfare/auto"]
+    # 2. Резервный быстрый запрос через logfare/auto (таймаут 35 сек)
+    fallback_models = ["logfare/auto"]
+    if active_model != PREFERRED_MODEL:
+        fallback_models.append(PREFERRED_MODEL)
 
     last_err = None
-    for url in CANDIDATE_BASE_URLS:
-        client = make_client(url)
-        for candidate_model in candidates[:5]:
-            try:
-                response = await client.chat.completions.create(
-                    model=candidate_model,
-                    messages=messages_payload,
-                    temperature=temperature,
-                    max_tokens=1500,
-                )
-                active_base_url = url
-                active_model = candidate_model
-                ai_client = client
-                return response.choices[0].message.content or ""
-            except (NotFoundError, APIStatusError) as e:
-                last_err = e
-                continue
+    backup_client = make_client(active_base_url, timeout_sec=35.0)
+    for candidate_model in fallback_models:
+        try:
+            response = await backup_client.chat.completions.create(
+                model=candidate_model,
+                messages=messages_payload,
+                temperature=temperature,
+                max_tokens=700,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            last_err = e
+            continue
 
-    raise last_err or RuntimeError("Сервер API вернул 404 на всех маршрутах.")
+    raise last_err or APITimeoutError(request=None)
 
 
 @tasks.loop(minutes=3)
@@ -323,7 +313,6 @@ async def on_message(message: discord.Message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_user_mentioned = bot.user in message.mentions
 
-    # Проверяем, не тегнули ли одноимённую роль бота вместо самого пользователя бота
     is_bot_role_mentioned = False
     if message.guild and message.role_mentions:
         bot_member = message.guild.me
@@ -334,7 +323,6 @@ async def on_message(message: discord.Message):
                 for role in message.role_mentions
             )
 
-    # Проверяем Reply (в том числе на старые сообщения бота, которых нет в кэше)
     is_reply_to_bot = False
     if message.reference is not None:
         if message.reference.resolved is not None:
@@ -349,7 +337,6 @@ async def on_message(message: discord.Message):
     if not (is_dm or is_user_mentioned or is_bot_role_mentioned or is_reply_to_bot):
         return
 
-    # Вырезаем упоминание пользователя и роли бота из текста
     clean_text = re.sub(rf"<@!?{bot.user.id}>", "", message.content)
     for role in message.role_mentions:
         clean_text = clean_text.replace(f"<@&{role.id}>", "")
@@ -384,8 +371,8 @@ async def on_message(message: discord.Message):
             for chunk in split_message(reply_text):
                 await safe_send(message, chunk)
 
-        except asyncio.TimeoutError:
-            await safe_send(message, "Сервер нейросети слишком долго думал и отвалился по таймауту. Попробуй ещё раз.")
+        except (asyncio.TimeoutError, APITimeoutError):
+            await safe_send(message, "Сервер нейросети завис и не ответил вовремя. Попробуй ещё раз через пару секунд.")
         except Exception as e:
             await safe_send(message, f"Ошибка при обращении к API: `{e}`")
 
