@@ -39,10 +39,10 @@ DEFAULT_HEADERS = {
     "Accept": "application/json",
 }
 
-# Возможные базовые URL на случай смены маршрутизации у провайдера
 CANDIDATE_BASE_URLS = list(dict.fromkeys([
-    RAW_BASE_URL if RAW_BASE_URL.endswith("/v1") else f"{RAW_BASE_URL}/v1",
+    RAW_BASE_URL,
     "https://logfare.ai/v1",
+    "https://logfare.ai",
     "https://api.logfare.ai/v1",
     "https://logfare.ai/api/v1",
 ]))
@@ -102,9 +102,10 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
-async def resolve_working_endpoint_and_models() -> tuple[str, list[str]]:
-    """Находит рабочий BASE_URL и получает актуальный список моделей с сервера."""
+async def resolve_working_endpoint_and_models() -> tuple[str, list[str], list[str]]:
+    """Находит рабочий BASE_URL и собирает диагностику по всем проверенным адресам."""
     global active_base_url, ai_client
+    diagnostics = []
 
     for url in CANDIDATE_BASE_URLS:
         test_client = make_client(url)
@@ -114,19 +115,22 @@ async def resolve_working_endpoint_and_models() -> tuple[str, list[str]]:
             if model_ids:
                 active_base_url = url
                 ai_client = test_client
-                print(f"[INFO] Рабочий эндпоинт найден: {url} (моделей: {len(model_ids)})")
-                return url, model_ids
+                diagnostics.append(f"✅ `{url}/models` -> OK ({len(model_ids)} моделей)")
+                return url, model_ids, diagnostics
+            else:
+                diagnostics.append(f"⚠️ `{url}/models` -> пустой список")
         except Exception as e:
-            print(f"[WARN] Эндпоинт {url}/models недоступен: {e}")
+            status = getattr(e, "status_code", type(e).__name__)
+            diagnostics.append(f"❌ `{url}/models` -> `{status}`")
 
-    return active_base_url, []
+    return active_base_url, [], diagnostics
 
 
 async def smart_chat_completion(messages_payload: list[dict], temperature: float) -> str:
-    """Отправляет запрос, при 404 сам находит рабочий эндпоинт и живую модель."""
-    global active_model
+    """Отправляет запрос, при 404 перебирает маршруты и живые модели."""
+    global active_model, active_base_url, ai_client
 
-    # 1. Сначала пробуем текущие активные URL и модель
+    # 1. Пробуем текущие активные URL и модель
     try:
         response = await ai_client.chat.completions.create(
             model=active_model,
@@ -137,14 +141,12 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
         return response.choices[0].message.content or ""
     except (NotFoundError, APIStatusError) as e:
         status = getattr(e, "status_code", None)
-        print(f"[WARN] Сбой на {active_base_url} / {active_model} (код {status}). Ищем рабочий маршрут...")
         if status not in (404, 502, 503):
             raise
 
-    # 2. Если получили 404/502/503 — запрашиваем у сервера живой список моделей
-    _, available_models = await resolve_working_endpoint_and_models()
+    # 2. Ищем рабочий эндпоинт и модели
+    _, available_models, _ = await resolve_working_endpoint_and_models()
 
-    # Формируем очередь моделей для перебора: желаемая -> qwen -> deepseek -> остальные
     candidates = []
     if PREFERRED_MODEL in available_models:
         candidates.append(PREFERRED_MODEL)
@@ -157,26 +159,28 @@ async def smart_chat_completion(messages_payload: list[dict], temperature: float
             candidates.append(m)
 
     if not candidates:
-        candidates = [PREFERRED_MODEL, "qwen-3.8-27b", "deepseek-v3", "deepseek-v4-flash"]
+        candidates = [PREFERRED_MODEL, "qwen-3.8-27b"]
 
     last_err = None
-    for candidate_model in candidates[:6]:
-        try:
-            response = await ai_client.chat.completions.create(
-                model=candidate_model,
-                messages=messages_payload,
-                temperature=temperature,
-                max_tokens=1500,
-            )
-            active_model = candidate_model
-            print(f"[INFO] Переключено на рабочую модель: {active_model}")
-            return response.choices[0].message.content or ""
-        except (NotFoundError, APIStatusError) as e:
-            last_err = e
-            print(f"[WARN] Модель {candidate_model} не ответила ({getattr(e, 'status_code', e)})")
-            continue
+    for url in CANDIDATE_BASE_URLS:
+        client = make_client(url)
+        for candidate_model in candidates[:4]:
+            try:
+                response = await client.chat.completions.create(
+                    model=candidate_model,
+                    messages=messages_payload,
+                    temperature=temperature,
+                    max_tokens=1500,
+                )
+                active_base_url = url
+                active_model = candidate_model
+                ai_client = client
+                return response.choices[0].message.content or ""
+            except (NotFoundError, APIStatusError) as e:
+                last_err = e
+                continue
 
-    raise last_err or RuntimeError("Ни одна из моделей API не ответила (404).")
+    raise last_err or RuntimeError("Сервер API вернул 404 на всех маршрутах.")
 
 
 @tasks.loop(minutes=3)
@@ -195,7 +199,9 @@ async def keep_alive_loop():
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user} (ID: {bot.user.id})")
-    url, models = await resolve_working_endpoint_and_models()
+    url, models, diag = await resolve_working_endpoint_and_models()
+    for line in diag:
+        print(line)
     if models:
         print(f"[INFO] Доступные модели: {', '.join(models[:10])}")
     if not keep_alive_loop.is_running():
@@ -220,6 +226,23 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         print(f"[ERROR] Ошибка команды: {error}")
 
 
+@bot.command(name="debug")
+@is_admin_or_owner()
+async def debug_api(ctx: commands.Context):
+    """Проверяет доступность серверов API прямо с хостинга Bothost."""
+    async with ctx.typing():
+        url, models, diag = await resolve_working_endpoint_and_models()
+        models_preview = ", ".join(models[:8]) if models else "не получены"
+        report = (
+            "**Диагностика API с сервера Bothost:**\n"
+            + "\n".join(diag)
+            + f"\n\n**Активный URL:** `{url}`\n"
+            + f"**Активная модель:** `{active_model}`\n"
+            + f"**Найденные модели:** `{models_preview}`"
+        )
+        await ctx.reply(report, mention_author=False)
+
+
 @bot.command(name="commands")
 async def show_commands(ctx: commands.Context):
     commands_text = (
@@ -232,7 +255,8 @@ async def show_commands(ctx: commands.Context):
         "• **`!clear`** — очистить память диалога бота в текущем канале.\n"
         "• **`!prompt`** — посмотреть текущий системный промпт.\n"
         "• **`!prompt <текст>`** — задать новый характер/промпт нейросети (сбрасывает историю).\n"
-        "• **`!prompt reset`** — вернуть стандартный промпт по умолчанию."
+        "• **`!prompt reset`** — вернуть стандартный промпт по умолчанию.\n"
+        "• **`!debug`** — проверить соединение с сервером нейросети."
     )
     await ctx.reply(commands_text, mention_author=False)
 
