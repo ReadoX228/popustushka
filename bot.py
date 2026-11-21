@@ -471,24 +471,30 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 # ==================== СЛЕШ-КОМАНДА /flux2 ====================
 
-@bot.tree.command(name="flux2", description="Сгенерировать изображение через FLUX.2 (с автопереводом промпта)")
+@bot.tree.command(name="flux2", description="Сгенерировать изображение через FLUX.2")
 @app_commands.describe(
-    prompt="Описание картинки (минимум 10 символов, можно на русском)",
+    prompt="Описание картинки (минимум 10 символов)",
+    translate="Перевести промпт на английский перед генерацией (по умолчанию Да)",
     image1="Референс-изображение 1 (необязательно)",
     image2="Референс-изображение 2 (необязательно)",
     image3="Референс-изображение 3 (необязательно)",
     model="Выбор модели FLUX (по умолчанию flux-2-dev)",
 )
 @app_commands.choices(
+    translate=[
+        app_commands.Choice(name="Да", value="yes"),
+        app_commands.Choice(name="Нет", value="no"),
+    ],
     model=[
         app_commands.Choice(name="flux-2-dev (Макс. качество и референсы)", value="flux-2-dev"),
         app_commands.Choice(name="flux-2-klein-9b (Быстро + хорошее качество)", value="flux-2-klein-9b"),
         app_commands.Choice(name="flux-2-klein-4b (Максимально быстро)", value="flux-2-klein-4b"),
-    ]
+    ],
 )
 async def flux2_command(
     interaction: discord.Interaction,
     prompt: str,
+    translate: app_commands.Choice[str] | None = None,
     image1: discord.Attachment | None = None,
     image2: discord.Attachment | None = None,
     image3: discord.Attachment | None = None,
@@ -514,18 +520,24 @@ async def flux2_command(
             refs.append(att)
 
     selected_model = model.value if model else DEFAULT_IMAGE_MODEL
+    should_translate = (translate.value == "yes") if translate else True
+
     await interaction.response.defer(thinking=True)
 
     try:
-        en_prompt = await translate_prompt_to_english(clean_prompt, len(refs))
-        image_bytes = await generate_flux2_image(en_prompt, refs, image_model=selected_model)
+        final_prompt = (
+            await translate_prompt_to_english(clean_prompt, len(refs))
+            if should_translate
+            else clean_prompt
+        )
+        image_bytes = await generate_flux2_image(final_prompt, refs, image_model=selected_model)
         file = discord.File(fp=io.BytesIO(image_bytes), filename="flux2_result.png")
 
         refs_info = f" | Референсов: {len(refs)}" if refs else ""
         short_orig = clean_prompt if len(clean_prompt) <= 220 else f"{clean_prompt[:217]}..."
         caption = f"🎨 **Модель:** `{selected_model}`{refs_info}\n**Промпт:** `{short_orig}`"
-        if en_prompt != clean_prompt:
-            short_en = en_prompt if len(en_prompt) <= 220 else f"{en_prompt[:217]}..."
+        if should_translate and final_prompt != clean_prompt:
+            short_en = final_prompt if len(final_prompt) <= 220 else f"{final_prompt[:217]}..."
             caption += f"\n**EN-промпт:** `{short_en}`"
 
         await interaction.followup.send(content=caption, file=file)
@@ -577,7 +589,7 @@ async def show_commands(ctx: commands.Context):
         "**Общение и генерация (для всех):**\n"
         f"• **Упоминание ({bot.user.mention} текст)** или **Reply** на сообщение бота — пообщаться с нейросетью (`{PREFERRED_MODEL}`).\n"
         "• **Личные сообщения (ЛС)** — пиши любой текст напрямую без упоминаний.\n"
-        "• **`/flux2 prompt:<текст> [image1] [image2] [image3] [model]`** — сгенерировать картинку через FLUX.2 (минимум 10 символов, до 3 референсов, автоперевод на EN).\n"
+        "• **`/flux2 prompt:<текст> [translate:Да/Нет] [image1..3] [model]`** — сгенерировать картинку через FLUX.2 (минимум 10 символов, до 3 референсов).\n"
         "• **`!commands`** — показать этот список команд.\n\n"
         "**Управление (только для создателя и админов):**\n"
         "• **`!clear`** — очистить память диалога бота в текущем канале.\n"
